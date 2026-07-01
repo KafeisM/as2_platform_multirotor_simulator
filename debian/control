@@ -1,0 +1,12 @@
+Source: ros-humble-as2-platform-multirotor-simulator
+Section: misc
+Priority: optional
+Maintainer: CVAR-UPM <cvar.upm3@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), ros-humble-ament-cmake, ros-humble-ament-cmake-gtest <!nocheck>, ros-humble-ament-index-cpp, ros-humble-ament-lint-auto <!nocheck>, ros-humble-ament-lint-common <!nocheck>, ros-humble-as2-core, ros-humble-as2-msgs, ros-humble-rclcpp, ros-humble-std-msgs, ros-humble-std-srvs, ros-humble-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-humble-as2-platform-multirotor-simulator
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-humble-ament-cmake, ros-humble-ament-index-cpp, ros-humble-as2-core, ros-humble-as2-msgs, ros-humble-rclcpp, ros-humble-std-msgs, ros-humble-std-srvs, ros-humble-ros-workspace
+Description: Lightweight simulator

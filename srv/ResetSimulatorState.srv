@@ -1,0 +1,31 @@
+# Request a deterministic simulator reset for one namespaced multirotor.
+# On success, the simulator is armed and position/yaw hold readiness is
+# established at the requested world-frame pose before the response is returned.
+float64 x
+float64 y
+float64 z
+float64 yaw
+float64 position_tolerance
+float64 yaw_tolerance
+float64 linear_speed_tolerance
+float64 angular_speed_tolerance
+---
+bool success
+string message
+float64 position_error
+float64 yaw_error
+float64 linear_speed_norm
+float64 angular_speed_norm
+float64 linear_acceleration_norm
+float64 angular_acceleration_norm
+float64 force_norm
+float64 torque_norm
+float64 motor_angular_velocity_norm
+float64 motor_angular_acceleration_norm
+bool dynamics_reset_applied
+bool motor_state_reset_applied
+bool controller_reset_applied
+bool imu_reset_applied
+bool odometry_reset_applied
+bool references_reset_applied
+bool dynamic_artifacts_cleared
