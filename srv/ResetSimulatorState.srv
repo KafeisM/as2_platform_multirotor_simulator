@@ -29,3 +29,5 @@ bool imu_reset_applied
 bool odometry_reset_applied
 bool references_reset_applied
 bool dynamic_artifacts_cleared
+bool platform_fsm_synced
+bool platform_control_mode_synced

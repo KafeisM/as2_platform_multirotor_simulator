@@ -43,6 +43,85 @@ mutating and reporting the following state:
 torque, and motor norms are at or below the internal artifact tolerance and all
 reset proof flags were applied.
 
+## AS2 platform state machine synchronization
+
+The low-level reset alone leaves the AS2 `AerialPlatform` layer untouched, and
+the base-class `sendCommand()` gate (`connected && armed && offboard && control
+mode settled && FSM not EMERGENCY`) then silently drops every motion reference:
+commands are accepted on the ROS side but never forwarded to the simulator.
+
+After mutating the simulator state, the reset callback therefore synchronizes
+the platform layer:
+
+| Artifact | Implementation proof | Response proof |
+|---|---|---|
+| Connected + FSM baseline | `resetPlatform()` (connected=true, FSM forced to DISARMED; the only sanctioned recovery from EMERGENCY) | `platform_fsm_synced` |
+| Armed | `setArmingState(true)` (arms simulator, FSM DISARMED -> LANDED) | `platform_fsm_synced` |
+| Offboard | `setOffboardControl(true)` | `platform_fsm_synced` |
+| FSM FLYING | `handleStateMachineEvent(TAKE_OFF)` then `handleStateMachineEvent(TOOK_OFF)` (LANDED -> TAKING_OFF -> FLYING) | `platform_fsm_synced` |
+| Control mode mirror | `setPlatformControlMode(POSITION / YAW_ANGLE / LOCAL_ENU_FRAME)` mirrors the forced simulator mode into `platform_info_msg_` so the next `SetControlMode` request (e.g. SPEED) is applied instead of skipped as already settled | `platform_control_mode_synced` |
+
+`platform_fsm_synced` is true only when every FSM transition in the sequence
+succeeded. Both flags are part of the `success` conjunction: a reset that
+cannot leave the platform armed, offboard, FLYING, and with a consistent
+control mode is reported as failed.
+
+## Timer dt re-baseline on reset
+
+The simulator update timers (dynamics, controller, inertial odometry) compute
+their integration step from wall-clock time. The last-update timestamps are
+stored as node members (`last_time_dynamics_`, `last_time_control_`,
+`last_time_inertial_odometry_`) instead of function-local statics so the reset
+callback can re-baseline them.
+
+`resetSimulatorStateCallback` calls `rebaselineTimerBookkeeping()` right after
+mutating the simulator state, setting all three timestamps to `this->now()`.
+The first post-reset step therefore integrates roughly one nominal timer tick
+instead of the whole gap spanned by the reset service handling. The timestamps
+are also baselined at construction, so the very first timer fire integrates
+only the construction-to-spin gap. The existing `dt <= 0` guards are kept and
+extended with a `std::isfinite(dt)` check.
+
+## Non-finite state guard on telemetry publishing
+
+`simulatorStateTimerCallback` validates the simulator state before publishing:
+ground-truth kinematics, inertial-odometry kinematics, and the IMU measurement
+must contain only finite values (position, orientation, velocities and
+accelerations). The vendored floor-collision clamp cannot catch NaN
+(`position.z() <= floor_height` is false for NaN), so without this guard a NaN
+would escape to IMU/Odom/GroundTruth/GPS/TF and crash RViz and downstream
+consumers.
+
+When a non-finite value is detected the callback:
+
+1. Logs a throttled error:
+   `Non-finite simulator state detected, skipping state publish and restoring
+   last known finite state`.
+2. Skips every publish for that cycle (IMU, odometry, ground truth, GPS, TF,
+   gimbal).
+3. Recovers the simulator instead of editing the vendored library: it restores
+   the dynamics state from `last_finite_state_` (the last fully finite state
+   snapshot, updated on every healthy publish cycle, at construction, and set
+   to the reset pose on every reset), resets the controller, the IMU, and
+   re-seeds and resets the inertial odometry from that snapshot pose.
+
+This is the least invasive recovery that keeps the vendored headers untouched:
+the simulator resumes from the newest provably finite state, which after a
+reset is the reset pose itself.
+
+## Defensive dt guard at integration call sites
+
+The vendored `multirotor_dynamic_model/dynamics.hpp` throws
+`std::invalid_argument` when `dt <= 0` reaches `update_dynamics`; an uncaught
+throw from a timer callback would `std::terminate` the node. All platform-side
+integration entry points (`update_dynamics`/`update_imu`,
+`update_controller`, `update_inertial_odometry`) live in the three timer
+callbacks, which `ownTakeoff`/`ownLand` also reuse for their manual spin
+loops. Each callback drops the tick when `dt <= 0` or non-finite, and the
+integration calls are additionally wrapped in a `try/catch` that logs a
+throttled `Skipping ... update step (dt=...)` error and skips the tick rather
+than letting the exception kill the node.
+
 ## Telemetry-side proof boundary
 
 The service response proves internal state mutation at the immediate reset

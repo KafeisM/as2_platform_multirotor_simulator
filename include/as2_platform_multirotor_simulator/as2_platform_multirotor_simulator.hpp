@@ -84,6 +84,7 @@ class MultirotorSimulatorPlatform : public as2::AerialPlatform
 {
   using Simulator = multirotor::Simulator<double, 4>;
   using SimulatorParams = multirotor::SimulatorParams<double, 4>;
+  using SimulatorState = multirotor::state::State<double, 4>;
   using Kinematics = multirotor::state::internal::Kinematics<double>;
   using ResetSimulatorState = as2_platform_multirotor_simulator::srv::ResetSimulatorState;
 
@@ -119,6 +120,19 @@ private:
   rclcpp::TimerBase::SharedPtr simulator_control_timer_;
   rclcpp::TimerBase::SharedPtr simulator_inertial_odometry_timer_;
   rclcpp::TimerBase::SharedPtr simulator_state_pub_timer_;
+
+  // Wall-clock dt bookkeeping for the simulator update timers. Kept as
+  // members (instead of function-local statics) so the reset service can
+  // re-baseline them and the first post-reset step integrates one nominal
+  // tick instead of the whole reset gap.
+  rclcpp::Time last_time_dynamics_;
+  rclcpp::Time last_time_control_;
+  rclcpp::Time last_time_inertial_odometry_;
+
+  // Last simulator state known to be fully finite. Used to recover the
+  // simulator when the integration produces non-finite values (NaN/Inf)
+  // that would otherwise escape into published topics and TF.
+  SimulatorState last_finite_state_;
 
   std::string frame_id_baselink_ = "base_link";
   std::string frame_id_earth_ = "earth";
@@ -196,6 +210,32 @@ private:
         this->get_logger(), "Error getting parameter %s: %s", param_name.c_str(), e.what());
     }
   }
+
+  /**
+   * @brief Re-baseline the timers dt bookkeeping to the current time
+   *
+   * Called at construction and after a simulator state reset so the next
+   * timer step integrates one nominal tick instead of the elapsed gap.
+  */
+  void rebaselineTimerBookkeeping();
+
+  /**
+   * @brief Check that every scalar of a kinematics state is finite
+   *
+   * @param kinematics Kinematics state to check
+   *
+   * @return true if position, orientation, velocities and accelerations
+   * contain only finite values
+  */
+  static bool isKinematicsFinite(const Kinematics & kinematics);
+
+  /**
+   * @brief Recover the simulator from a non-finite (NaN/Inf) state
+   *
+   * Restores the last known finite dynamics state and resets controller,
+   * IMU and inertial odometry, which may hold non-finite internals.
+  */
+  void recoverFromNonFiniteState();
 
   /**
    * @brief Simulator timer callback

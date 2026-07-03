@@ -53,6 +53,10 @@ MultirotorSimulatorPlatform::MultirotorSimulatorPlatform(const rclcpp::NodeOptio
   // Read parameters
   readParams(platform_params_);
 
+  // Baseline the timers dt bookkeeping and the last known finite state
+  rebaselineTimerBookkeeping();
+  last_finite_state_ = simulator_.get_state();
+
   // Timers
   RCLCPP_INFO(this->get_logger(), "Using update freq: %f", platform_params_.update_freq);
   RCLCPP_INFO(this->get_logger(), "Using control freq: %f", platform_params_.control_freq);
@@ -556,6 +560,48 @@ void MultirotorSimulatorPlatform::resetSimulatorStateCallback(
   const bool odometry_reset_applied = true;
   const bool controller_reset_applied = true;
 
+  control_state_ = reset_state.kinematics;
+
+  // Re-baseline the timers dt bookkeeping so the first post-reset simulator
+  // step integrates one nominal tick instead of the whole reset gap, and
+  // track the reset state as the last known finite state for NaN recovery.
+  rebaselineTimerBookkeeping();
+  last_finite_state_ = reset_state;
+
+  // Synchronize the AS2 platform layer with the post-reset flying state. The
+  // base class sendCommand() gate requires connected + armed + offboard and a
+  // settled control mode before forwarding commands to ownSendCommand();
+  // without this sync, post-reset motion references are accepted on the ROS
+  // side but never applied by the simulator.
+  // resetPlatform() forces connected=true and FSM=DISARMED, which is also the
+  // only sanctioned recovery from the EMERGENCY state.
+  resetPlatform();
+  bool platform_fsm_synced = setArmingState(true);  // FSM: DISARMED -> LANDED
+  platform_fsm_synced = setOffboardControl(true) && platform_fsm_synced;
+  platform_fsm_synced =
+    handleStateMachineEvent(as2_msgs::msg::PlatformStateMachineEvent::TAKE_OFF) &&
+    platform_fsm_synced;  // FSM: LANDED -> TAKING_OFF
+  platform_fsm_synced =
+    handleStateMachineEvent(as2_msgs::msg::PlatformStateMachineEvent::TOOK_OFF) &&
+    platform_fsm_synced;  // FSM: TAKING_OFF -> FLYING
+  if (!platform_fsm_synced) {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "Reset could not synchronize the AS2 platform state machine to FLYING");
+  }
+
+  // Mirror the forced simulator control mode (POSITION / YAW_ANGLE) into the
+  // platform info so the next SetControlMode request (e.g. SPEED) is applied
+  // to the simulator instead of being skipped as already settled.
+  as2_msgs::msg::ControlMode reset_control_mode;
+  reset_control_mode.control_mode = as2_msgs::msg::ControlMode::POSITION;
+  reset_control_mode.yaw_mode = as2_msgs::msg::ControlMode::YAW_ANGLE;
+  reset_control_mode.reference_frame = as2_msgs::msg::ControlMode::LOCAL_ENU_FRAME;
+  const bool platform_control_mode_synced = setPlatformControlMode(reset_control_mode);
+
+  // References must be applied AFTER the platform sync: setArmingState(true)
+  // reaches simulator arm(), which clobbers reference_position_.z() to the
+  // floor height and would otherwise make the position controller descend.
   auto zero_motors = simulator_.get_reference_motors_angular_velocity();
   zero_motors.setZero();
   simulator_.set_refence_motors_angular_velocity(zero_motors);
@@ -567,7 +613,6 @@ void MultirotorSimulatorPlatform::resetSimulatorStateCallback(
   simulator_.set_reference_acro(0.0, zero_vector);
   simulator_.set_control_mode(multirotor::ControlMode::POSITION, multirotor::YawControlMode::ANGLE);
   const bool references_reset_applied = true;
-  control_state_ = reset_state.kinematics;
 
   command_pose_msg_.header.frame_id = frame_id_earth_;
   command_pose_msg_.header.stamp = this->now();
@@ -613,6 +658,8 @@ void MultirotorSimulatorPlatform::resetSimulatorStateCallback(
   response->imu_reset_applied = imu_reset_applied;
   response->odometry_reset_applied = odometry_reset_applied;
   response->references_reset_applied = references_reset_applied;
+  response->platform_fsm_synced = platform_fsm_synced;
+  response->platform_control_mode_synced = platform_control_mode_synced;
 
   constexpr double artifact_tolerance = 1e-9;
   response->dynamic_artifacts_cleared =
@@ -633,9 +680,16 @@ void MultirotorSimulatorPlatform::resetSimulatorStateCallback(
     response->yaw_error <= request->yaw_tolerance &&
     response->linear_speed_norm <= request->linear_speed_tolerance &&
     response->angular_speed_norm <= request->angular_speed_tolerance &&
-    response->dynamic_artifacts_cleared;
-  response->message = response->success ?
-    "reset state applied" : "reset state outside tolerance after mutation";
+    response->dynamic_artifacts_cleared &&
+    response->platform_fsm_synced &&
+    response->platform_control_mode_synced;
+  if (response->success) {
+    response->message = "reset state applied";
+  } else if (!response->platform_fsm_synced || !response->platform_control_mode_synced) {
+    response->message = "platform FSM/control-mode sync failed after reset";
+  } else {
+    response->message = "reset state outside tolerance after mutation";
+  }
 }
 
 Eigen::Vector3d MultirotorSimulatorPlatform::readVectorParams(const std::string & param_name)
@@ -841,32 +895,71 @@ void MultirotorSimulatorPlatform::readParams(PlatformParams & platform_params)
   RCLCPP_INFO(this->get_logger(), "Parameters read.");
 }
 
+void MultirotorSimulatorPlatform::rebaselineTimerBookkeeping()
+{
+  const rclcpp::Time current_time = this->now();
+  last_time_dynamics_ = current_time;
+  last_time_control_ = current_time;
+  last_time_inertial_odometry_ = current_time;
+}
+
+bool MultirotorSimulatorPlatform::isKinematicsFinite(const Kinematics & kinematics)
+{
+  return kinematics.position.allFinite() &&
+         kinematics.orientation.coeffs().allFinite() &&
+         kinematics.linear_velocity.allFinite() &&
+         kinematics.angular_velocity.allFinite() &&
+         kinematics.linear_acceleration.allFinite() &&
+         kinematics.angular_acceleration.allFinite();
+}
+
+void MultirotorSimulatorPlatform::recoverFromNonFiniteState()
+{
+  // Restore the dynamics to the last known finite state and reset the
+  // components whose internal state may also hold non-finite values.
+  simulator_.get_dynamics().set_state(last_finite_state_);
+  simulator_.get_controller().reset_controller();
+  simulator_.get_imu().reset();
+  simulator_.get_inertial_odometry().set_initial_position(
+    last_finite_state_.kinematics.position);
+  simulator_.get_inertial_odometry().set_initial_orientation(
+    last_finite_state_.kinematics.orientation);
+  simulator_.get_inertial_odometry().reset();
+  control_state_ = last_finite_state_.kinematics;
+}
+
 void MultirotorSimulatorPlatform::simulatorTimerCallback()
 {
   // Get time
   rclcpp::Time current_time = this->now();
-  static rclcpp::Time last_time_dynamics = current_time;
-  double dt = (current_time - last_time_dynamics).seconds();
-  last_time_dynamics = current_time;
+  double dt = (current_time - last_time_dynamics_).seconds();
+  last_time_dynamics_ = current_time;
 
-  if (dt <= 0.0) {
+  if (dt <= 0.0 || !std::isfinite(dt)) {
     return;
   }
 
-  // Update simulator
-  simulator_.update_dynamics(dt);
-  simulator_.update_imu(dt);
+  // Update simulator. The vendored dynamics model throws
+  // std::invalid_argument if dt <= 0 ever reaches it; skip the tick and log
+  // instead of letting the exception terminate the node.
+  try {
+    simulator_.update_dynamics(dt);
+    simulator_.update_imu(dt);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping dynamics update step (dt=%f): %s", dt, e.what());
+  }
 }
 
 void MultirotorSimulatorPlatform::simulatorControlTimerCallback()
 {
   // Get time
   rclcpp::Time current_time = this->now();
-  static rclcpp::Time last_time_control = current_time;
-  double dt = (current_time - last_time_control).seconds();
-  last_time_control = current_time;
+  double dt = (current_time - last_time_control_).seconds();
+  last_time_control_ = current_time;
 
-  if (dt <= 0.0) {
+  if (dt <= 0.0 || !std::isfinite(dt)) {
     return;
   }
   control_state_ = simulator_.get_state().kinematics;
@@ -875,22 +968,33 @@ void MultirotorSimulatorPlatform::simulatorControlTimerCallback()
     control_state_.orientation = simulator_.get_odometry().orientation;
   }
 
-  simulator_.update_controller(dt, control_state_);
+  try {
+    simulator_.update_controller(dt, control_state_);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping controller update step (dt=%f): %s", dt, e.what());
+  }
 }
 
 void MultirotorSimulatorPlatform::simulatorInertialOdometryTimerCallback()
 {
   // Get time
   rclcpp::Time current_time = this->now();
-  static rclcpp::Time last_time_control = current_time;
-  double dt = (current_time - last_time_control).seconds();
-  last_time_control = current_time;
+  double dt = (current_time - last_time_inertial_odometry_).seconds();
+  last_time_inertial_odometry_ = current_time;
 
-  if (dt <= 0.0) {
+  if (dt <= 0.0 || !std::isfinite(dt)) {
     return;
   }
 
-  simulator_.update_inertial_odometry(dt);
+  try {
+    simulator_.update_inertial_odometry(dt);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping inertial odometry update step (dt=%f): %s", dt, e.what());
+  }
 }
 
 void MultirotorSimulatorPlatform::simulatorStateTimerCallback()
@@ -898,12 +1002,35 @@ void MultirotorSimulatorPlatform::simulatorStateTimerCallback()
   // Get time
   rclcpp::Time current_time = this->now();
 
+  // Get ground truth simulator state
+  const SimulatorState simulator_state = simulator_.get_state();
+
   // Get odometry simulator state for imu orientation
   const Kinematics odometry_kinematics = simulator_.get_odometry();
 
   // Get imu simulator
   Eigen::Vector3d imu_angular_velocity, imu_acceleration;
   simulator_.get_imu_measurement(imu_angular_velocity, imu_acceleration);
+
+  // Guard against non-finite state escaping into topics and TF (a NaN in
+  // /tf crashes RViz and downstream consumers, and the floor collision
+  // clamp cannot catch NaN). Skip this publish cycle and restore the
+  // simulator to the last known finite state so it can recover.
+  if (!isKinematicsFinite(simulator_state.kinematics) ||
+    !isKinematicsFinite(odometry_kinematics) ||
+    !imu_angular_velocity.allFinite() || !imu_acceleration.allFinite())
+  {
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Non-finite simulator state detected, skipping state publish and "
+      "restoring last known finite state");
+    recoverFromNonFiniteState();
+    return;
+  }
+
+  // Track the last fully finite state for non-finite state recovery
+  last_finite_state_ = simulator_state;
+
   geometry_msgs::msg::Vector3 imu_angular_velocity_msg;
   imu_angular_velocity_msg.x = imu_angular_velocity.x();
   imu_angular_velocity_msg.y = imu_angular_velocity.y();
@@ -929,12 +1056,10 @@ void MultirotorSimulatorPlatform::simulatorStateTimerCallback()
   as2_interface_.convertToOdom(odometry_kinematics, odometry, current_time);
   sensor_odom_estimate_ptr_->updateData(odometry);
 
-  // Get ground truth simulator state
-
+  // Publish ground truth
   geometry_msgs::msg::PoseStamped ground_truth_pose;
   geometry_msgs::msg::TwistStamped ground_truth_twist;
-  const Kinematics kinematics =
-    simulator_.get_state().kinematics;
+  const Kinematics & kinematics = simulator_state.kinematics;
   as2_interface_.convertToGroundTruth(
     kinematics, ground_truth_pose, ground_truth_twist, current_time);
 
